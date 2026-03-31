@@ -1,0 +1,17 @@
+[package]
+name = "rusty-claude-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap = { version = "4.5.38", features = ["derive"] }
+compat-harness = { path = "../compat-harness" }
+crossterm = "0.29.0"
+pulldown-cmark = "0.13.0"
+runtime = { path = "../runtime" }
+syntect = { version = "5.2.0", default-features = false, features = ["default-fancy"] }
+
+[lints]
+workspace = true
