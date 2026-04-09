@@ -234,7 +234,8 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 /// override is `None`.
 #[must_use]
 pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
-    plugin_override.unwrap_or_else(|| max_tokens_for_model(model))
+    let requested = plugin_override.unwrap_or_else(|| max_tokens_for_model(model));
+    model_token_limit(model).map_or(requested, |limit| requested.min(limit.max_output_tokens))
 }
 
 #[must_use]
@@ -252,6 +253,13 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
+        }),
+		"gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" | "openai/gpt-4.1"
+        | "openai/gpt-4.1-mini" | "openai/gpt-4.1-nano" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            // OpenAI-compatible providers currently use this metadata for max-output
+            // safety clamping; context-window preflight is not applied to GPT-4.1.
+            context_window_tokens: u32::MAX,
         }),
         _ => None,
     }
@@ -610,7 +618,25 @@ mod tests {
                 .context_window_tokens,
             131_072
         );
+		assert_eq!(
+            model_token_limit("openai/gpt-4.1-mini")
+                .expect("openai/gpt-4.1-mini should be registered")
+                .max_output_tokens,
+            32_768
+        );
+        assert_eq!(
+            model_token_limit("gpt-4.1-mini")
+                .expect("gpt-4.1-mini should be registered")
+                .max_output_tokens,
+            32_768
+        );
     }
+
+    #[test]
+    fn model_max_tokens_clamp_plugin_override_for_gpt_4_1() {
+        let effective = max_tokens_for_model_with_override("openai/gpt-4.1-mini", Some(64_000));
+        assert_eq!(effective, 32_768);
+	}
 
     #[test]
     fn preflight_blocks_requests_that_exceed_the_model_context_window() {

@@ -6,3 +6,5 @@ archive/
 .claude/settings.local.json
 .claude/sessions/
 *.bat
+.claw/
+

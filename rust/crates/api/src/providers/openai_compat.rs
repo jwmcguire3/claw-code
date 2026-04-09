@@ -14,7 +14,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, Provider, ProviderFuture};
+use super::{model_token_limit, preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -758,8 +758,10 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
 
     // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
     let wire_model = strip_routing_prefix(&request.model);
-
-    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+	let max_tokens = model_token_limit(&request.model)
+        .map_or(request.max_tokens, |limit| request.max_tokens.min(limit.max_output_tokens));
+    
+	// gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
     // We send the correct field based on the wire model name so gpt-5.x requests
     // don't fail with "unknown field max_tokens".
     let max_tokens_key = if wire_model.starts_with("gpt-5") {
@@ -770,7 +772,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
 
     let mut payload = json!({
         "model": wire_model,
-        max_tokens_key: request.max_tokens,
+        max_tokens_key: max_tokens,
         "messages": messages,
         "stream": request.stream,
     });
@@ -1499,6 +1501,23 @@ mod tests {
         assert!(
             payload.get("max_completion_tokens").is_none(),
             "gpt-4o must not emit max_completion_tokens"
+        );
+    }
+	
+    #[test]
+    fn gpt_4_1_max_tokens_are_clamped_to_registered_limit() {
+        let request = MessageRequest {
+            model: "openai/gpt-4.1-mini".to_string(),
+            max_tokens: 64_000,
+            messages: vec![],
+            stream: false,
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        assert_eq!(
+            payload["max_tokens"],
+            json!(32_768),
+            "outbound max_tokens must be clamped to the model max output tokens"
         );
     }
 }
