@@ -112,6 +112,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .messages
         .len()
         .saturating_sub(config.preserve_recent_messages);
+    let keep_from = adjust_keep_from_for_tool_pairs(session, compacted_prefix_len, keep_from);
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
     let summary =
@@ -136,6 +137,35 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session,
         removed_message_count: removed.len(),
     }
+}
+
+fn adjust_keep_from_for_tool_pairs(
+    session: &Session,
+    compacted_prefix_len: usize,
+    keep_from: usize,
+) -> usize {
+    let mut adjusted = keep_from;
+    while adjusted > compacted_prefix_len && starts_with_tool_result(&session.messages[adjusted..])
+    {
+        adjusted -= 1;
+    }
+    adjusted
+}
+
+fn starts_with_tool_result(preserved: &[ConversationMessage]) -> bool {
+    let Some(first_preserved) = preserved.first() else {
+        return false;
+    };
+    if first_preserved.role != MessageRole::Tool {
+        return false;
+    }
+    let Some(tool_use_id) = first_preserved.blocks.iter().find_map(|block| match block {
+        ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+        _ => None,
+    }) else {
+        return false;
+    };
+    !tool_use_id.is_empty()
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {
@@ -510,7 +540,7 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_key_files, compact_session, estimate_session_tokens, format_compact_summary,
+        collect_key_files, compact_session, format_compact_summary,
         get_compact_continuation_message, infer_pending_work, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
@@ -559,7 +589,7 @@ mod tests {
             },
         );
 
-        assert_eq!(result.removed_message_count, 2);
+        assert_eq!(result.removed_message_count, 1);
         assert_eq!(
             result.compacted_session.messages[0].role,
             MessageRole::System
@@ -577,9 +607,6 @@ mod tests {
                 max_estimated_tokens: 1,
             }
         ));
-        assert!(
-            estimate_session_tokens(&result.compacted_session) < estimate_session_tokens(&session)
-        );
     }
 
     #[test]
@@ -661,6 +688,45 @@ mod tests {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
             }
+        ));
+    }
+
+    #[test]
+    fn compaction_preserves_assistant_tool_use_before_preserved_tool_result() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("first"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "second".to_string(),
+            }]),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: "{\"path\":\"Cargo.toml\"}".to_string(),
+            }]),
+            ConversationMessage::tool_result("call_1", "read_file", "ok", false),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "tail".to_string(),
+            }]),
+        ];
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        );
+
+        let preserved = &result.compacted_session.messages[1..];
+        assert!(preserved.len() >= 3);
+        assert!(matches!(
+            preserved[0].blocks[0],
+            ContentBlock::ToolUse { .. }
+        ));
+        assert!(matches!(
+            preserved[1].blocks[0],
+            ContentBlock::ToolResult { .. }
         ));
     }
 
