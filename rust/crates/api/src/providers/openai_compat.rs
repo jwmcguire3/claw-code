@@ -842,11 +842,14 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             if text.is_empty() && tool_calls.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
+                let mut assistant_message = json!({
                     "role": "assistant",
                     "content": (!text.is_empty()).then_some(text),
-                    "tool_calls": tool_calls,
-                })]
+                });
+                if !tool_calls.is_empty() {
+                    assistant_message["tool_calls"] = Value::Array(tool_calls);
+                }
+                vec![assistant_message]
             }
         }
         _ => message
@@ -860,12 +863,11 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 InputContentBlock::ToolResult {
                     tool_use_id,
                     content,
-                    is_error,
+                    is_error: _,
                 } => Some(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
                 })),
                 InputContentBlock::ToolUse { .. } => None,
             })
@@ -1519,5 +1521,126 @@ mod tests {
             json!(32_768),
             "outbound max_tokens must be clamped to the model max output tokens"
         );
+    }
+
+    #[test]
+    fn assistant_text_only_message_omits_tool_calls() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::Text {
+                        text: "hello".to_string(),
+                    }],
+                }],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["messages"][0]["role"], json!("assistant"));
+        assert_eq!(payload["messages"][0]["content"], json!("hello"));
+        assert!(payload["messages"][0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn assistant_message_with_tool_call_serializes_tool_calls() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "weather".to_string(),
+                        input: json!({"city": "Paris"}),
+                    }],
+                }],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["messages"][0]["role"], json!("assistant"));
+        assert_eq!(payload["messages"][0]["content"], json!(null));
+        assert_eq!(payload["messages"][0]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(
+            payload["messages"][0]["tool_calls"][0]["function"]["name"],
+            json!("weather")
+        );
+        assert_eq!(
+            payload["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            json!("{\"city\":\"Paris\"}")
+        );
+    }
+
+    #[test]
+    fn tool_result_messages_use_openai_compatible_shape() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "72F".to_string(),
+                        }],
+                        is_error: true,
+                    }],
+                }],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        assert_eq!(payload["messages"][0]["role"], json!("tool"));
+        assert_eq!(payload["messages"][0]["tool_call_id"], json!("call_1"));
+        assert_eq!(payload["messages"][0]["content"], json!("72F"));
+        assert!(payload["messages"][0].get("is_error").is_none());
+    }
+
+    #[test]
+    fn outbound_payload_never_contains_empty_tool_calls_arrays() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::Text {
+                            text: "text only".to_string(),
+                        }],
+                    },
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::ToolUse {
+                            id: "call_1".to_string(),
+                            name: "weather".to_string(),
+                            input: json!({"city": "Paris"}),
+                        }],
+                    },
+                ],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        let messages = payload["messages"].as_array().expect("messages array");
+        for message in messages {
+            if let Some(tool_calls) = message.get("tool_calls") {
+                assert!(
+                    tool_calls
+                        .as_array()
+                        .is_some_and(|array| !array.is_empty()),
+                    "tool_calls must be omitted or contain at least one entry"
+                );
+            }
+        }
     }
 }
