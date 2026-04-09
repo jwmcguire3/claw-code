@@ -258,8 +258,12 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
-		"gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" | "openai/gpt-4.1"
-        | "openai/gpt-4.1-mini" | "openai/gpt-4.1-nano" => Some(ModelTokenLimit {
+        "gpt-4.1"
+        | "gpt-4.1-mini"
+        | "gpt-4.1-nano"
+        | "openai/gpt-4.1"
+        | "openai/gpt-4.1-mini"
+        | "openai/gpt-4.1-nano" => Some(ModelTokenLimit {
             max_output_tokens: 32_768,
             // OpenAI-compatible providers currently use this metadata for max-output
             // safety clamping; context-window preflight is not applied to GPT-4.1.
@@ -633,7 +637,7 @@ mod tests {
                 .context_window_tokens,
             131_072
         );
-		assert_eq!(
+        assert_eq!(
             model_token_limit("openai/gpt-4.1-mini")
                 .expect("openai/gpt-4.1-mini should be registered")
                 .max_output_tokens,
@@ -651,7 +655,7 @@ mod tests {
     fn model_max_tokens_clamp_plugin_override_for_gpt_4_1() {
         let effective = max_tokens_for_model_with_override("openai/gpt-4.1-mini", Some(64_000));
         assert_eq!(effective, 32_768);
-	}
+    }
 
     #[test]
     fn preflight_blocks_requests_that_exceed_the_model_context_window() {

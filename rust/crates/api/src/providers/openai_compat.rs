@@ -752,16 +752,17 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             "content": system,
         }));
     }
-    for message in &request.messages {
-        messages.extend(translate_message(message));
-    }
+    messages.extend(normalize_openai_tool_message_ordering(translate_messages(
+        &request.messages,
+    )));
 
     // Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
     let wire_model = strip_routing_prefix(&request.model);
-	let max_tokens = model_token_limit(&request.model)
-        .map_or(request.max_tokens, |limit| request.max_tokens.min(limit.max_output_tokens));
-    
-	// gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
+    let max_tokens = model_token_limit(&request.model).map_or(request.max_tokens, |limit| {
+        request.max_tokens.min(limit.max_output_tokens)
+    });
+
+    // gpt-5* requires `max_completion_tokens`; older OpenAI models accept both.
     // We send the correct field based on the wire model name so gpt-5.x requests
     // don't fail with "unknown field max_tokens".
     let max_tokens_key = if wire_model.starts_with("gpt-5") {
@@ -818,6 +819,77 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     payload
+}
+
+fn translate_messages(messages: &[InputMessage]) -> Vec<Value> {
+    let mut translated = Vec::new();
+    for message in messages {
+        translated.extend(translate_message(message));
+    }
+    translated
+}
+
+fn normalize_openai_tool_message_ordering(messages: Vec<Value>) -> Vec<Value> {
+    let mut normalized = Vec::new();
+    let mut known_tool_calls = BTreeMap::<String, Value>::new();
+
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for call in tool_calls {
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        known_tool_calls.insert(id.to_string(), call.clone());
+                    }
+                }
+            }
+            normalized.push(message);
+            continue;
+        }
+
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            normalized.push(message);
+            continue;
+        }
+
+        let tool_call_id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let has_matching_predecessor = normalized
+            .last()
+            .and_then(|previous| previous.get("tool_calls"))
+            .and_then(Value::as_array)
+            .is_some_and(|tool_calls| {
+                tool_calls
+                    .iter()
+                    .any(|call| call.get("id").and_then(Value::as_str) == Some(tool_call_id))
+            });
+        if !has_matching_predecessor {
+            let tool_call = known_tool_calls
+                .get(tool_call_id)
+                .cloned()
+                .unwrap_or_else(|| synthetic_tool_call(tool_call_id));
+            normalized.push(json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [tool_call],
+            }));
+        }
+        normalized.push(message);
+    }
+
+    normalized
+}
+
+fn synthetic_tool_call(tool_call_id: &str) -> Value {
+    json!({
+        "id": tool_call_id,
+        "type": "function",
+        "function": {
+            "name": "unknown_tool",
+            "arguments": "{}",
+        }
+    })
 }
 
 fn translate_message(message: &InputMessage) -> Vec<Value> {
@@ -1187,7 +1259,8 @@ mod tests {
 
         assert_eq!(payload["messages"][0]["role"], json!("system"));
         assert_eq!(payload["messages"][1]["role"], json!("user"));
-        assert_eq!(payload["messages"][2]["role"], json!("tool"));
+        assert_eq!(payload["messages"][2]["role"], json!("assistant"));
+        assert_eq!(payload["messages"][3]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
     }
@@ -1505,7 +1578,7 @@ mod tests {
             "gpt-4o must not emit max_completion_tokens"
         );
     }
-	
+
     #[test]
     fn gpt_4_1_max_tokens_are_clamped_to_registered_limit() {
         let request = MessageRequest {
@@ -1566,7 +1639,10 @@ mod tests {
 
         assert_eq!(payload["messages"][0]["role"], json!("assistant"));
         assert_eq!(payload["messages"][0]["content"], json!(null));
-        assert_eq!(payload["messages"][0]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(
+            payload["messages"][0]["tool_calls"][0]["id"],
+            json!("call_1")
+        );
         assert_eq!(
             payload["messages"][0]["tool_calls"][0]["function"]["name"],
             json!("weather")
@@ -1598,10 +1674,11 @@ mod tests {
             OpenAiCompatConfig::openai(),
         );
 
-        assert_eq!(payload["messages"][0]["role"], json!("tool"));
-        assert_eq!(payload["messages"][0]["tool_call_id"], json!("call_1"));
-        assert_eq!(payload["messages"][0]["content"], json!("72F"));
-        assert!(payload["messages"][0].get("is_error").is_none());
+        assert_eq!(payload["messages"][0]["role"], json!("assistant"));
+        assert_eq!(payload["messages"][1]["role"], json!("tool"));
+        assert_eq!(payload["messages"][1]["tool_call_id"], json!("call_1"));
+        assert_eq!(payload["messages"][1]["content"], json!("72F"));
+        assert!(payload["messages"][1].get("is_error").is_none());
     }
 
     #[test]
@@ -1635,11 +1712,137 @@ mod tests {
         for message in messages {
             if let Some(tool_calls) = message.get("tool_calls") {
                 assert!(
-                    tool_calls
-                        .as_array()
-                        .is_some_and(|array| !array.is_empty()),
+                    tool_calls.as_array().is_some_and(|array| !array.is_empty()),
                     "tool_calls must be omitted or contain at least one entry"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn orphaned_tool_result_gets_synthetic_assistant_tool_call() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage {
+                    role: "user".to_string(),
+                    content: vec![InputContentBlock::ToolResult {
+                        tool_use_id: "call_orphan".to_string(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: "late result".to_string(),
+                        }],
+                        is_error: false,
+                    }],
+                }],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        let messages = payload["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], json!("assistant"));
+        assert_eq!(messages[0]["tool_calls"][0]["id"], json!("call_orphan"));
+        assert_eq!(messages[1]["role"], json!("tool"));
+        assert_eq!(messages[1]["tool_call_id"], json!("call_orphan"));
+    }
+
+    #[test]
+    fn tool_result_after_matching_assistant_remains_unchanged() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::ToolUse {
+                            id: "call_1".to_string(),
+                            name: "weather".to_string(),
+                            input: json!({"city": "Paris"}),
+                        }],
+                    },
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::ToolResult {
+                            tool_use_id: "call_1".to_string(),
+                            content: vec![ToolResultContentBlock::Text {
+                                text: "72F".to_string(),
+                            }],
+                            is_error: false,
+                        }],
+                    },
+                ],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        let messages = payload["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], json!("assistant"));
+        assert_eq!(messages[1]["role"], json!("tool"));
+        assert_eq!(messages[1]["tool_call_id"], json!("call_1"));
+    }
+
+    #[test]
+    fn every_outbound_tool_message_has_matching_preceding_assistant_tool_call() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-4o".to_string(),
+                max_tokens: 64,
+                messages: vec![
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::Text {
+                            text: "summarized context".to_string(),
+                        }],
+                    },
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::ToolResult {
+                            tool_use_id: "call_missing".to_string(),
+                            content: vec![ToolResultContentBlock::Text {
+                                text: "done".to_string(),
+                            }],
+                            is_error: false,
+                        }],
+                    },
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::ToolUse {
+                            id: "call_present".to_string(),
+                            name: "clock".to_string(),
+                            input: json!({"zone": "UTC"}),
+                        }],
+                    },
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::ToolResult {
+                            tool_use_id: "call_present".to_string(),
+                            content: vec![ToolResultContentBlock::Text {
+                                text: "12:00".to_string(),
+                            }],
+                            is_error: false,
+                        }],
+                    },
+                ],
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+
+        let messages = payload["messages"].as_array().expect("messages array");
+        for pair in messages.windows(2) {
+            if pair[1]["role"] == json!("tool") {
+                assert_eq!(pair[0]["role"], json!("assistant"));
+                let tool_call_id = pair[1]["tool_call_id"].as_str().expect("tool_call_id");
+                assert!(pair[0]["tool_calls"]
+                    .as_array()
+                    .is_some_and(|tool_calls| tool_calls
+                        .iter()
+                        .any(|call| { call["id"].as_str() == Some(tool_call_id) })));
             }
         }
     }
