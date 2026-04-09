@@ -173,11 +173,15 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     // route to the correct provider regardless of which auth env vars are set.
     // Without this, detect_provider_kind falls through to the auth-sniffer
     // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
-    if canonical.starts_with("openai/")
-        || canonical.starts_with("gpt-")
-        || canonical.starts_with("deepseek/")
-        || canonical.starts_with("deepseek-")
-    {
+    if canonical.starts_with("deepseek/") || canonical.starts_with("deepseek-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        });
+    }
+    if canonical.starts_with("openai/") || canonical.starts_with("gpt-") {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
             auth_env: "OPENAI_API_KEY",
@@ -316,6 +320,11 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "OPENAI_API_KEY",
         "OpenAI-compat",
         "prefix your model name with `openai/` (e.g. `--model openai/gpt-4.1-mini`) so prefix routing selects the OpenAI-compatible provider, and set `OPENAI_BASE_URL` if you are pointing at OpenRouter/Ollama/a local server",
+    ),
+    (
+        "DEEPSEEK_API_KEY",
+        "DeepSeek",
+        "use a DeepSeek model name (e.g. `--model deepseek-chat` or `--model deepseek/deepseek-reasoner`) so prefix routing selects the DeepSeek OpenAI-compatible backend",
     ),
     (
         "XAI_API_KEY",
@@ -525,10 +534,17 @@ mod tests {
             .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
         assert_eq!(kind2, ProviderKind::OpenAi);
 
-        // DeepSeek models are OpenAI-compatible and should route the same way.
-        let kind3 = super::metadata_for_model("deepseek-chat")
-            .map(|m| m.provider)
-            .unwrap_or_else(|| detect_provider_kind("deepseek-chat"));
+        // DeepSeek models are OpenAI-compatible but use dedicated DeepSeek
+        // credentials/base URL so they don't default to api.openai.com.
+        let deepseek_meta = super::metadata_for_model("deepseek-chat")
+            .expect("deepseek-chat should resolve to explicit provider metadata");
+        assert_eq!(deepseek_meta.auth_env, "DEEPSEEK_API_KEY");
+        assert_eq!(deepseek_meta.base_url_env, "DEEPSEEK_BASE_URL");
+        assert!(
+            deepseek_meta.default_base_url.contains("api.deepseek.com"),
+            "DeepSeek should default to api.deepseek.com"
+        );
+        let kind3 = deepseek_meta.provider;
         assert_eq!(kind3, ProviderKind::OpenAi);
 
         let kind4 = super::metadata_for_model("deepseek/deepseek-reasoner")
@@ -811,6 +827,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
@@ -829,6 +846,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
@@ -860,6 +878,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
@@ -883,10 +902,39 @@ NO_EQUALS_LINE
     }
 
     #[test]
+    fn anthropic_missing_credentials_hint_detects_deepseek_api_key() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", Some("sk-deepseek-test"));
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+
+        // when
+        let hint = anthropic_missing_credentials_hint()
+            .expect("DEEPSEEK_API_KEY presence should produce a hint");
+
+        // then
+        assert!(
+            hint.contains("DEEPSEEK_API_KEY is set"),
+            "hint should name DEEPSEEK_API_KEY: {hint}"
+        );
+        assert!(
+            hint.contains("DeepSeek"),
+            "hint should identify the DeepSeek provider: {hint}"
+        );
+        assert!(
+            hint.contains("deepseek-chat"),
+            "hint should suggest a deepseek model alias: {hint}"
+        );
+    }
+
+    #[test]
     fn anthropic_missing_credentials_hint_detects_dashscope_api_key() {
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
 
@@ -914,6 +962,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", Some("sk-deepseek-test"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
 
