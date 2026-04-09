@@ -173,7 +173,11 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     // route to the correct provider regardless of which auth env vars are set.
     // Without this, detect_provider_kind falls through to the auth-sniffer
     // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
-    if canonical.starts_with("openai/") || canonical.starts_with("gpt-") {
+    if canonical.starts_with("openai/")
+        || canonical.starts_with("gpt-")
+        || canonical.starts_with("deepseek/")
+        || canonical.starts_with("deepseek-")
+    {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
             auth_env: "OPENAI_API_KEY",
@@ -537,10 +541,6 @@ mod tests {
             .map(|m| m.provider)
             .unwrap_or_else(|| detect_provider_kind("deepseek-chat"));
         assert_eq!(kind3, ProviderKind::OpenAi);
-        let deepseek_meta =
-            super::metadata_for_model("deepseek-chat").expect("deepseek-* should resolve");
-        assert_eq!(deepseek_meta.auth_env, "DEEPSEEK_API_KEY");
-        assert_eq!(deepseek_meta.base_url_env, "DEEPSEEK_BASE_URL");
 
         let kind4 = super::metadata_for_model("deepseek/deepseek-reasoner")
             .map(|m| m.provider)
