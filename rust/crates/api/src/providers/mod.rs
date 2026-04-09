@@ -181,6 +181,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
         });
     }
+    // DeepSeek exposes an OpenAI-compatible REST surface but requires
+    // DeepSeek-specific credentials and base URL defaults.
+    if canonical.starts_with("deepseek/") || canonical.starts_with("deepseek-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        });
+    }
     // Alibaba DashScope compatible-mode endpoint. Routes qwen/* and bare
     // qwen-* model names (qwen-max, qwen-plus, qwen-turbo, qwen-qwq, etc.)
     // to the OpenAI-compat client pointed at DashScope's /compatible-mode/v1.
@@ -318,6 +328,11 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "DASHSCOPE_API_KEY",
         "Alibaba DashScope",
         "prefix your model name with `qwen/` or `qwen-` (e.g. `--model qwen-plus`) so prefix routing selects the DashScope backend",
+    ),
+    (
+        "DEEPSEEK_API_KEY",
+        "DeepSeek",
+        "use a DeepSeek model alias (e.g. `--model deepseek-chat`) so prefix routing selects the DeepSeek backend",
     ),
 ];
 
@@ -516,6 +531,21 @@ mod tests {
             .map(|m| m.provider)
             .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
         assert_eq!(kind2, ProviderKind::OpenAi);
+
+        // DeepSeek models are OpenAI-compatible and should route the same way.
+        let kind3 = super::metadata_for_model("deepseek-chat")
+            .map(|m| m.provider)
+            .unwrap_or_else(|| detect_provider_kind("deepseek-chat"));
+        assert_eq!(kind3, ProviderKind::OpenAi);
+        let deepseek_meta =
+            super::metadata_for_model("deepseek-chat").expect("deepseek-* should resolve");
+        assert_eq!(deepseek_meta.auth_env, "DEEPSEEK_API_KEY");
+        assert_eq!(deepseek_meta.base_url_env, "DEEPSEEK_BASE_URL");
+
+        let kind4 = super::metadata_for_model("deepseek/deepseek-reasoner")
+            .map(|m| m.provider)
+            .unwrap_or_else(|| detect_provider_kind("deepseek/deepseek-reasoner"));
+        assert_eq!(kind4, ProviderKind::OpenAi);
     }
 
     #[test]
