@@ -276,9 +276,7 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         // DeepSeek chat endpoints reject outputs above 8k completion tokens.
         "deepseek-chat" | "deepseek/deepseek-chat" => Some(ModelTokenLimit {
             max_output_tokens: 8_192,
-            // OpenAI-compatible providers currently use this metadata for max-output
-            // safety clamping; context-window preflight is not applied to DeepSeek.
-            context_window_tokens: u32::MAX,
+            context_window_tokens: 131_072,
         }),
         _ => None,
     }

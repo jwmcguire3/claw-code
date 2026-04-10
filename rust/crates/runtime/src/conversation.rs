@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -17,12 +18,17 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const DEFAULT_RECENT_TURN_RETENTION: usize = 6;
+const DEFAULT_SAFETY_MARGIN_TOKENS: u32 = 1024;
+const SOFT_CONTEXT_THRESHOLD_RATIO: f64 = 0.78;
+const HARD_CONTEXT_THRESHOLD_RATIO: f64 = 0.90;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
     pub messages: Vec<ConversationMessage>,
+    pub reserved_output_tokens: u32,
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -52,6 +58,18 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    fn model_context_limit_tokens(&self) -> Option<u32> {
+        None
+    }
+
+    fn max_output_cap_tokens(&self) -> Option<u32> {
+        None
+    }
+
+    fn estimated_tool_schema_tokens(&self) -> u32 {
+        0
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -136,6 +154,8 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    recent_turn_retention: usize,
+    safety_margin_tokens: u32,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -185,6 +205,8 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            recent_turn_retention: DEFAULT_RECENT_TURN_RETENTION,
+            safety_margin_tokens: DEFAULT_SAFETY_MARGIN_TOKENS,
         }
     }
 
@@ -218,6 +240,12 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_recent_turn_retention(mut self, recent_turn_retention: usize) -> Self {
+        self.recent_turn_retention = recent_turn_retention.max(2);
         self
     }
 
@@ -319,9 +347,13 @@ where
                 return Err(error);
             }
 
-            let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
+            let mut budget = self.compute_preflight_budget();
+            let request = match self.prepare_request_for_budget(&mut budget) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
             };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
@@ -547,6 +579,229 @@ where
         })
     }
 
+    fn prepare_request_for_budget(
+        &mut self,
+        budget: &mut PreflightBudget,
+    ) -> Result<ApiRequest, RuntimeError> {
+        let Some(limit) = self.api_client.model_context_limit_tokens() else {
+            return Ok(ApiRequest {
+                system_prompt: self.system_prompt.clone(),
+                messages: self.session.messages.clone(),
+                reserved_output_tokens: budget.reserved_output_tokens,
+            });
+        };
+
+        let soft_threshold = ((limit as f64) * SOFT_CONTEXT_THRESHOLD_RATIO) as u32;
+        let hard_threshold = ((limit as f64) * HARD_CONTEXT_THRESHOLD_RATIO) as u32;
+        let mut attempted_actions = Vec::new();
+        let mut compaction_applied = false;
+        let mut largest_payload_trimmed = 0usize;
+        let compaction_started = Instant::now();
+        let mut retries = 0u32;
+
+        if budget.total_tokens >= soft_threshold {
+            let forced = budget.total_tokens >= hard_threshold;
+            if self.apply_compaction_step(forced, budget) {
+                compaction_applied = true;
+                attempted_actions.push(if forced {
+                    "forced_compaction_hard_threshold".to_string()
+                } else {
+                    "opportunistic_compaction_soft_threshold".to_string()
+                });
+            }
+        }
+
+        if budget.total_tokens > limit {
+            retries = 1;
+            if self.apply_compaction_step(true, budget) {
+                compaction_applied = true;
+                attempted_actions.push("recovery_compaction".to_string());
+            }
+            let reduced = self.reduce_reserved_output_tokens(budget, limit);
+            if reduced {
+                attempted_actions.push("reduced_reserved_output_tokens".to_string());
+            }
+            let trimmed = self.trim_largest_payloads(limit, budget);
+            if trimmed > 0 {
+                largest_payload_trimmed = trimmed;
+                attempted_actions.push("trimmed_large_payload".to_string());
+            }
+        }
+
+        self.record_preflight_metrics(
+            budget,
+            limit,
+            compaction_applied,
+            retries,
+            largest_payload_trimmed,
+            compaction_started.elapsed().as_millis() as u64,
+        );
+
+        if budget.total_tokens > limit {
+            let overflow = budget.total_tokens.saturating_sub(limit);
+            return Err(RuntimeError::new(format!(
+                "context_window_blocked preflight_failed model_limit={limit} input_tokens={} reserved_output_tokens={} overflow={} actions_attempted={}",
+                budget.input_tokens,
+                budget.reserved_output_tokens,
+                overflow,
+                attempted_actions.join(",")
+            )));
+        }
+
+        Ok(ApiRequest {
+            system_prompt: self.system_prompt.clone(),
+            messages: self.session.messages.clone(),
+            reserved_output_tokens: budget.reserved_output_tokens,
+        })
+    }
+
+    fn apply_compaction_step(&mut self, forced: bool, budget: &mut PreflightBudget) -> bool {
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                preserve_recent_messages: self.recent_turn_retention,
+                max_estimated_tokens: if forced {
+                    0
+                } else {
+                    budget.input_tokens as usize
+                },
+            },
+        );
+        if result.removed_message_count == 0 {
+            return false;
+        }
+        self.session = result.compacted_session;
+        *budget = self.compute_preflight_budget_with_reserved(budget.reserved_output_tokens);
+        true
+    }
+
+    fn reduce_reserved_output_tokens(&mut self, budget: &mut PreflightBudget, limit: u32) -> bool {
+        let max_reserved = limit.saturating_sub(self.safety_margin_tokens + budget.input_tokens);
+        if max_reserved >= budget.reserved_output_tokens {
+            return false;
+        }
+        budget.reserved_output_tokens = max_reserved;
+        budget.total_tokens = budget.input_tokens.saturating_add(budget.reserved_output_tokens);
+        true
+    }
+
+    fn trim_largest_payloads(&mut self, limit: u32, budget: &mut PreflightBudget) -> usize {
+        let mut largest_trimmed = 0usize;
+        while budget.total_tokens > limit {
+            let Some((message_index, block_index, size)) = self.find_largest_trim_target() else {
+                break;
+            };
+            largest_trimmed = largest_trimmed.max(size);
+            self.trim_payload_at(message_index, block_index);
+            *budget = self.compute_preflight_budget_with_reserved(budget.reserved_output_tokens);
+        }
+        largest_trimmed
+    }
+
+    fn find_largest_trim_target(&self) -> Option<(usize, usize, usize)> {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for (message_index, message) in self.session.messages.iter().enumerate() {
+            for (block_index, block) in message.blocks.iter().enumerate() {
+                let size = match block {
+                    ContentBlock::ToolResult { output, .. } => output.len(),
+                    ContentBlock::Text { text } if message.role != crate::session::MessageRole::System => text.len(),
+                    _ => 0,
+                };
+                if size <= 1_200 {
+                    continue;
+                }
+                if best.is_none_or(|(_, _, current)| size > current) {
+                    best = Some((message_index, block_index, size));
+                }
+            }
+        }
+        best
+    }
+
+    fn trim_payload_at(&mut self, message_index: usize, block_index: usize) {
+        let Some(block) = self
+            .session
+            .messages
+            .get_mut(message_index)
+            .and_then(|message| message.blocks.get_mut(block_index))
+        else {
+            return;
+        };
+        match block {
+            ContentBlock::ToolResult { output, .. } => {
+                *output = summarize_blob(output);
+            }
+            ContentBlock::Text { text } => {
+                *text = summarize_blob(text);
+            }
+            ContentBlock::ToolUse { .. } => {}
+        }
+    }
+
+    fn compute_preflight_budget(&self) -> PreflightBudget {
+        self.compute_preflight_budget_with_reserved(self.dynamic_reserved_output_tokens())
+    }
+
+    fn compute_preflight_budget_with_reserved(&self, reserved_output_tokens: u32) -> PreflightBudget {
+        let system_tokens = estimate_string_tokens(&self.system_prompt.join("\n\n"));
+        let input_tokens = estimate_session_tokens(&self.session)
+            .saturating_add(system_tokens)
+            .saturating_add(self.api_client.estimated_tool_schema_tokens() as usize)
+            as u32;
+        PreflightBudget {
+            input_tokens,
+            reserved_output_tokens,
+            total_tokens: input_tokens.saturating_add(reserved_output_tokens),
+        }
+    }
+
+    fn dynamic_reserved_output_tokens(&self) -> u32 {
+        let cap = self.api_client.max_output_cap_tokens().unwrap_or(8_192);
+        let mut reserved = infer_dynamic_output_reserve(&self.session);
+        if let Some(limit) = self.api_client.model_context_limit_tokens() {
+            let budget_cap = limit.saturating_sub(self.safety_margin_tokens);
+            reserved = reserved.min(budget_cap);
+        }
+        reserved.clamp(256, cap.max(256))
+    }
+
+    fn record_preflight_metrics(
+        &self,
+        budget: &PreflightBudget,
+        limit: u32,
+        compaction_applied: bool,
+        retries: u32,
+        largest_payload_trimmed: usize,
+        compaction_latency_ms: u64,
+    ) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+        let overflow = budget.total_tokens.saturating_sub(limit);
+        let mut attributes = Map::new();
+        attributes.insert("input_tokens".to_string(), Value::from(budget.input_tokens));
+        attributes.insert(
+            "reserved_output_tokens".to_string(),
+            Value::from(budget.reserved_output_tokens),
+        );
+        attributes.insert("limit".to_string(), Value::from(limit));
+        attributes.insert("overflow".to_string(), Value::from(overflow));
+        attributes.insert(
+            "compaction_applied".to_string(),
+            Value::Bool(compaction_applied),
+        );
+        attributes.insert("retries".to_string(), Value::from(retries));
+        attributes.insert(
+            "largest_payload_trimmed".to_string(),
+            Value::from(largest_payload_trimmed as u64),
+        );
+        attributes.insert(
+            "compaction_latency_ms".to_string(),
+            Value::from(compaction_latency_ms),
+        );
+        session_tracer.record("context_budget_preflight", attributes);
+    }
+
     fn record_turn_started(&self, user_input: &str) {
         let Some(session_tracer) = &self.session_tracer else {
             return;
@@ -671,6 +926,55 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreflightBudget {
+    input_tokens: u32,
+    reserved_output_tokens: u32,
+    total_tokens: u32,
+}
+
+fn estimate_string_tokens(content: &str) -> usize {
+    (content.len() / 4).saturating_add(1)
+}
+
+fn infer_dynamic_output_reserve(session: &Session) -> u32 {
+    let hint = session
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message.role {
+            crate::session::MessageRole::User => message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.to_ascii_lowercase()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if hint.contains("long-form") || hint.contains("long form") || hint.contains("detailed essay") {
+        4_000
+    } else if hint.contains("patch")
+        || hint.contains("implement")
+        || hint.contains("refactor")
+        || hint.contains("code")
+    {
+        1_800
+    } else {
+        900
+    }
+}
+
+fn summarize_blob(content: &str) -> String {
+    const KEEP: usize = 1_200;
+    if content.len() <= KEEP {
+        return content.to_string();
+    }
+    format!(
+        "{}\n...[trimmed {} chars for context budget]...",
+        &content[..KEEP],
+        content.len().saturating_sub(KEEP)
+    )
 }
 
 fn build_assistant_message(
@@ -806,9 +1110,11 @@ mod tests {
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
     use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
@@ -1695,5 +2001,295 @@ mod tests {
 
         // then
         assert_eq!(error.to_string(), "upstream failed");
+    }
+
+    #[test]
+    fn over_budget_request_auto_compacts_and_succeeds() {
+        struct BudgetApi;
+        impl ApiClient for BudgetApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert!(request.messages.len() <= 8, "request should be compacted");
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+            fn model_context_limit_tokens(&self) -> Option<u32> {
+                Some(4_000)
+            }
+            fn max_output_cap_tokens(&self) -> Option<u32> {
+                Some(8_192)
+            }
+        }
+
+        let mut session = Session::new();
+        for idx in 0..18 {
+            session.messages.push(crate::session::ConversationMessage::user_text(
+                format!("message {idx} {}", "x".repeat(400)),
+            ));
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            BudgetApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        runtime
+            .run_turn("implement a patch", None)
+            .expect("compaction flow should recover over-budget turn");
+    }
+
+    #[test]
+    fn dynamic_max_tokens_replaces_global_8192_reservation() {
+        struct CaptureReserveApi {
+            reserve: Arc<Mutex<Vec<u32>>>,
+        }
+        impl ApiClient for CaptureReserveApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.reserve
+                    .lock()
+                    .expect("mutex")
+                    .push(request.reserved_output_tokens);
+                Ok(vec![
+                    AssistantEvent::TextDelta("short".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+            fn model_context_limit_tokens(&self) -> Option<u32> {
+                Some(32_000)
+            }
+            fn max_output_cap_tokens(&self) -> Option<u32> {
+                Some(8_192)
+            }
+        }
+
+        let reserve = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CaptureReserveApi {
+                reserve: Arc::clone(&reserve),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("quick diagnosis please", None)
+            .expect("turn should succeed");
+        let reserve_value = reserve.lock().expect("mutex")[0];
+        assert!(reserve_value < 8_192, "reserve must be dynamic not fixed");
+        assert!((600..=1_200).contains(&reserve_value));
+    }
+
+    #[test]
+    fn hard_overflow_triggers_trim_path() {
+        struct TrimApi;
+        impl ApiClient for TrimApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let last_tool = request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|message| message.blocks.first())
+                    .expect("block");
+                if let ContentBlock::ToolResult { output, .. } = last_tool {
+                    assert!(
+                        output.contains("[trimmed"),
+                        "largest payload should be summarized"
+                    );
+                }
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+            fn model_context_limit_tokens(&self) -> Option<u32> {
+                Some(3_000)
+            }
+            fn max_output_cap_tokens(&self) -> Option<u32> {
+                Some(4_000)
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages.push(crate::session::ConversationMessage::tool_result(
+            "tool-1",
+            "read_file",
+            "A".repeat(12_000),
+            false,
+        ));
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            TrimApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        runtime
+            .run_turn("short diagnosis", None)
+            .expect("trim path should recover");
+    }
+
+    #[test]
+    fn still_over_budget_returns_structured_error_with_token_breakdown() {
+        struct TinyLimitApi;
+        impl ApiClient for TinyLimitApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                panic!("stream should not run when preflight remains over budget");
+            }
+            fn model_context_limit_tokens(&self) -> Option<u32> {
+                Some(512)
+            }
+            fn max_output_cap_tokens(&self) -> Option<u32> {
+                Some(1_000)
+            }
+        }
+
+        let mut session = Session::new();
+        for _ in 0..12 {
+            session.messages.push(crate::session::ConversationMessage::user_text(
+                "B".repeat(800),
+            ));
+        }
+        let mut runtime = ConversationRuntime::new(
+            session,
+            TinyLimitApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let error = runtime
+            .run_turn("code patch", None)
+            .expect_err("over-budget should return structured error");
+        let rendered = error.to_string();
+        assert!(rendered.contains("model_limit="));
+        assert!(rendered.contains("input_tokens="));
+        assert!(rendered.contains("reserved_output_tokens="));
+        assert!(rendered.contains("overflow="));
+        assert!(rendered.contains("actions_attempted="));
+    }
+
+    #[test]
+    fn compaction_preserves_recent_turns_and_pinned_state() {
+        struct InspectApi;
+        impl ApiClient for InspectApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let all_text = format!("{:?}", request.messages);
+                assert!(all_text.contains("PINNED constraint: keep me"));
+                assert!(all_text.contains("most recent user turn"));
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+            fn model_context_limit_tokens(&self) -> Option<u32> {
+                Some(6_000)
+            }
+            fn max_output_cap_tokens(&self) -> Option<u32> {
+                Some(8_192)
+            }
+        }
+
+        let mut session = Session::new();
+        session.messages.push(crate::session::ConversationMessage {
+            role: MessageRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: "PINNED constraint: keep me".to_string(),
+            }],
+            usage: None,
+        });
+        for idx in 0..16 {
+            session.messages.push(crate::session::ConversationMessage::user_text(
+                format!("old turn {idx} {}", "x".repeat(300)),
+            ));
+        }
+        session
+            .messages
+            .push(crate::session::ConversationMessage::user_text(
+                "most recent user turn".to_string(),
+            ));
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            InspectApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_recent_turn_retention(6);
+        runtime
+            .run_turn("implement code change", None)
+            .expect("compaction should keep pinned and recent context");
+    }
+
+    #[test]
+    fn soft_threshold_triggers_proactive_compaction() {
+        struct TraceApi;
+        impl ApiClient for TraceApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("ok".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+            fn model_context_limit_tokens(&self) -> Option<u32> {
+                Some(10_000)
+            }
+            fn max_output_cap_tokens(&self) -> Option<u32> {
+                Some(8_192)
+            }
+        }
+
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-soft-threshold", sink.clone());
+        let mut session = Session::new();
+        for idx in 0..24 {
+            session.messages.push(crate::session::ConversationMessage::user_text(
+                format!("turn {idx} {}", "x".repeat(1_500)),
+            ));
+        }
+        let mut runtime = ConversationRuntime::new(
+            session,
+            TraceApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_session_tracer(tracer);
+        runtime
+            .run_turn("implement patch", None)
+            .expect("turn should succeed");
+
+        let traces = sink.events();
+        let preflight = traces.iter().find_map(|event| match event {
+            TelemetryEvent::SessionTrace(trace) if trace.name == "context_budget_preflight" => {
+                Some(trace.attributes.clone())
+            }
+            _ => None,
+        });
+        let attrs = preflight.expect("preflight trace");
+        assert_eq!(attrs.get("compaction_applied"), Some(&Value::Bool(true)));
     }
 }
