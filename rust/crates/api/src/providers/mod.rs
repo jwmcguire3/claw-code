@@ -273,6 +273,13 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             // safety clamping; context-window preflight is not applied to GPT-4.1.
             context_window_tokens: u32::MAX,
         }),
+        // DeepSeek chat endpoints reject outputs above 8k completion tokens.
+        "deepseek-chat" | "deepseek/deepseek-chat" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            // OpenAI-compatible providers currently use this metadata for max-output
+            // safety clamping; context-window preflight is not applied to DeepSeek.
+            context_window_tokens: u32::MAX,
+        }),
         _ => None,
     }
 }
@@ -587,6 +594,7 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("deepseek-chat"), 8_192);
     }
 
     #[test]
