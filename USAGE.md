@@ -167,6 +167,18 @@ cd rust
 ./target/debug/claw --model "openai/gpt-4.1-mini" prompt "summarize this repository in one sentence"
 ```
 
+For direct DeepSeek API usage:
+
+```bash
+export DEEPSEEK_BASE_URL="https://api.deepseek.com/v1"
+export DEEPSEEK_API_KEY="sk-..."
+
+./target/debug/claw --model "deepseek-chat" prompt "hello"
+./target/debug/claw --model "deepseek-reasoner" prompt "hello"
+```
+
+If you want DeepSeek through OpenRouter instead, keep `OPENAI_BASE_URL=https://openrouter.ai/api/v1` and use the gateway slugs (`openai/deepseek/deepseek-chat`, `openai/deepseek/deepseek-reasoner`).
+
 ### Alibaba DashScope (Qwen)
 
 For Qwen models via Alibaba's native DashScope API (higher rate limits than OpenRouter):
@@ -194,12 +206,13 @@ Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `te
 |---|---|---|---|---|
 | **Anthropic** (direct) | Anthropic Messages API | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` or OAuth (`claw login`) | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
 | **xAI** | OpenAI-compatible | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
+| **DeepSeek** | OpenAI-compatible | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` |
 | **OpenAI-compatible** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
 | **DashScope** (Alibaba) | OpenAI-compatible | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 
 The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
 
-**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
+**Model-name prefix routing:** If a model name starts with `openai/`, `gpt-`, `deepseek/`, `deepseek-`, `qwen/`, or `qwen-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment.
 
 ### Tested models and aliases
 

@@ -1,0 +1,41 @@
+{
+  "clawExe": "C:\\Users\\jwmcg\\OneDrive\\Documents\\AI Projects\\Claw Code\\rust\\target\\debug\\claw.exe",
+  "defaultModel": "openai/gpt-4.1-mini",
+  "defaultPermissionMode": "workspace-write",
+  "defaultOutputFormat": "text",
+  "defaultAllowedTools": "read,glob,grep,write,edit",
+  "defaultResumeLatest": false,
+  "defaultLaunchMode": "interactive",
+  "models": [
+    "openai/gpt-4.1-mini",
+    "openai/gpt-4.1",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "opus",
+    "sonnet",
+    "haiku",
+    "grok",
+    "grok-mini",
+    "qwen-plus"
+  ],
+  "permissionModes": [
+    "read-only",
+    "workspace-write",
+    "danger-full-access"
+  ],
+  "outputFormats": [
+    "text",
+    "json"
+  ],
+  "commonAllowedToolsSets": [
+    "",
+    "read,glob",
+    "read,glob,grep",
+    "read,glob,grep,write,edit"
+  ],
+  "newRepoTemplates": {
+    "createReadme": true,
+    "createGitignore": true,
+    "createClawSettings": true
+  }
+}

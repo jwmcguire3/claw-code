@@ -173,6 +173,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     // route to the correct provider regardless of which auth env vars are set.
     // Without this, detect_provider_kind falls through to the auth-sniffer
     // order and misroutes to Anthropic if ANTHROPIC_API_KEY is present.
+    if canonical.starts_with("deepseek/") || canonical.starts_with("deepseek-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DEEPSEEK_API_KEY",
+            base_url_env: "DEEPSEEK_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DEEPSEEK_BASE_URL,
+        });
+    }
     if canonical.starts_with("openai/") || canonical.starts_with("gpt-") {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
@@ -234,7 +242,8 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 /// override is `None`.
 #[must_use]
 pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
-    plugin_override.unwrap_or_else(|| max_tokens_for_model(model))
+    let requested = plugin_override.unwrap_or_else(|| max_tokens_for_model(model));
+    model_token_limit(model).map_or(requested, |limit| requested.min(limit.max_output_tokens))
 }
 
 #[must_use]
@@ -252,6 +261,24 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
+        }),
+        "gpt-4.1"
+        | "gpt-4.1-mini"
+        | "gpt-4.1-nano"
+        | "openai/gpt-4.1"
+        | "openai/gpt-4.1-mini"
+        | "openai/gpt-4.1-nano" => Some(ModelTokenLimit {
+            max_output_tokens: 32_768,
+            // OpenAI-compatible providers currently use this metadata for max-output
+            // safety clamping; context-window preflight is not applied to GPT-4.1.
+            context_window_tokens: u32::MAX,
+        }),
+        // DeepSeek chat endpoints reject outputs above 8k completion tokens.
+        "deepseek-chat" | "deepseek/deepseek-chat" => Some(ModelTokenLimit {
+            max_output_tokens: 8_192,
+            // OpenAI-compatible providers currently use this metadata for max-output
+            // safety clamping; context-window preflight is not applied to DeepSeek.
+            context_window_tokens: u32::MAX,
         }),
         _ => None,
     }
@@ -300,6 +327,11 @@ const FOREIGN_PROVIDER_ENV_VARS: &[(&str, &str, &str)] = &[
         "OPENAI_API_KEY",
         "OpenAI-compat",
         "prefix your model name with `openai/` (e.g. `--model openai/gpt-4.1-mini`) so prefix routing selects the OpenAI-compatible provider, and set `OPENAI_BASE_URL` if you are pointing at OpenRouter/Ollama/a local server",
+    ),
+    (
+        "DEEPSEEK_API_KEY",
+        "DeepSeek",
+        "use a DeepSeek model name (e.g. `--model deepseek-chat` or `--model deepseek/deepseek-reasoner`) so prefix routing selects the DeepSeek OpenAI-compatible backend",
     ),
     (
         "XAI_API_KEY",
@@ -508,6 +540,24 @@ mod tests {
             .map(|m| m.provider)
             .unwrap_or_else(|| detect_provider_kind("gpt-4o"));
         assert_eq!(kind2, ProviderKind::OpenAi);
+
+        // DeepSeek models are OpenAI-compatible but use dedicated DeepSeek
+        // credentials/base URL so they don't default to api.openai.com.
+        let deepseek_meta = super::metadata_for_model("deepseek-chat")
+            .expect("deepseek-chat should resolve to explicit provider metadata");
+        assert_eq!(deepseek_meta.auth_env, "DEEPSEEK_API_KEY");
+        assert_eq!(deepseek_meta.base_url_env, "DEEPSEEK_BASE_URL");
+        assert!(
+            deepseek_meta.default_base_url.contains("api.deepseek.com"),
+            "DeepSeek should default to api.deepseek.com"
+        );
+        let kind3 = deepseek_meta.provider;
+        assert_eq!(kind3, ProviderKind::OpenAi);
+
+        let kind4 = super::metadata_for_model("deepseek/deepseek-reasoner")
+            .map(|m| m.provider)
+            .unwrap_or_else(|| detect_provider_kind("deepseek/deepseek-reasoner"));
+        assert_eq!(kind4, ProviderKind::OpenAi);
     }
 
     #[test]
@@ -544,6 +594,7 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("deepseek-chat"), 8_192);
     }
 
     #[test]
@@ -610,6 +661,24 @@ mod tests {
                 .context_window_tokens,
             131_072
         );
+        assert_eq!(
+            model_token_limit("openai/gpt-4.1-mini")
+                .expect("openai/gpt-4.1-mini should be registered")
+                .max_output_tokens,
+            32_768
+        );
+        assert_eq!(
+            model_token_limit("gpt-4.1-mini")
+                .expect("gpt-4.1-mini should be registered")
+                .max_output_tokens,
+            32_768
+        );
+    }
+
+    #[test]
+    fn model_max_tokens_clamp_plugin_override_for_gpt_4_1() {
+        let effective = max_tokens_for_model_with_override("openai/gpt-4.1-mini", Some(64_000));
+        assert_eq!(effective, 32_768);
     }
 
     #[test]
@@ -766,6 +835,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
@@ -784,6 +854,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
@@ -815,6 +886,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
 
@@ -838,10 +910,39 @@ NO_EQUALS_LINE
     }
 
     #[test]
+    fn anthropic_missing_credentials_hint_detects_deepseek_api_key() {
+        // given
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", Some("sk-deepseek-test"));
+        let _xai = EnvVarGuard::set("XAI_API_KEY", None);
+        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", None);
+
+        // when
+        let hint = anthropic_missing_credentials_hint()
+            .expect("DEEPSEEK_API_KEY presence should produce a hint");
+
+        // then
+        assert!(
+            hint.contains("DEEPSEEK_API_KEY is set"),
+            "hint should name DEEPSEEK_API_KEY: {hint}"
+        );
+        assert!(
+            hint.contains("DeepSeek"),
+            "hint should identify the DeepSeek provider: {hint}"
+        );
+        assert!(
+            hint.contains("deepseek-chat"),
+            "hint should suggest a deepseek model alias: {hint}"
+        );
+    }
+
+    #[test]
     fn anthropic_missing_credentials_hint_detects_dashscope_api_key() {
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", None);
         let _xai = EnvVarGuard::set("XAI_API_KEY", None);
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
 
@@ -869,6 +970,7 @@ NO_EQUALS_LINE
         // given
         let _lock = env_lock();
         let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("sk-openrouter-varleg"));
+        let _deepseek = EnvVarGuard::set("DEEPSEEK_API_KEY", Some("sk-deepseek-test"));
         let _xai = EnvVarGuard::set("XAI_API_KEY", Some("xai-test-key"));
         let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("sk-dashscope-test"));
 
