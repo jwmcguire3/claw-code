@@ -7006,7 +7006,7 @@ impl ApiClient for AnthropicRuntimeClient {
         let is_post_tool = request_ends_with_tool_result(&request);
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: request.reserved_output_tokens,
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
@@ -7045,6 +7045,24 @@ impl ApiClient for AnthropicRuntimeClient {
 
             Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
+    }
+
+    fn model_context_limit_tokens(&self) -> Option<u32> {
+        api::model_token_limit(&self.model).map(|limit| limit.context_window_tokens)
+    }
+
+    fn max_output_cap_tokens(&self) -> Option<u32> {
+        Some(max_tokens_for_model(&self.model))
+    }
+
+    fn estimated_tool_schema_tokens(&self) -> u32 {
+        if !self.enable_tools {
+            return 0;
+        }
+        let specs = filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref());
+        serde_json::to_vec(&specs)
+            .ok()
+            .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
     }
 }
 
