@@ -261,7 +261,8 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     let parsed: Value =
         serde_json::from_str(stdout.trim()).expect("resume status output should be json");
     assert_eq!(parsed["kind"], "status");
-    assert_eq!(parsed["model"], "restored-session");
+    // model is null in resume mode (not known without --model flag)
+    assert!(parsed["model"].is_null());
     assert_eq!(parsed["permission_mode"], "danger-full-access");
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
@@ -273,6 +274,47 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert!(parsed["workspace"]["changed_files"].is_number());
     assert_eq!(parsed["workspace"]["loaded_config_files"].as_u64(), Some(0));
     assert!(parsed["sandbox"]["filesystem_mode"].as_str().is_some());
+}
+
+#[test]
+fn resumed_status_surfaces_persisted_model() {
+    // given — create a session with model already set
+    let temp_dir = unique_temp_dir("resume-status-model");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+
+    let mut session = Session::new();
+    session.model = Some("claude-sonnet-4-6".to_string());
+    session
+        .push_user_text("model persistence fixture")
+        .expect("write ok");
+    session.save_to_path(&session_path).expect("persist ok");
+
+    // when
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/status",
+        ],
+    );
+
+    // then
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["kind"], "status");
+    assert_eq!(
+        parsed["model"], "claude-sonnet-4-6",
+        "model should round-trip through session metadata"
+    );
 }
 
 #[test]
@@ -316,6 +358,175 @@ fn resumed_sandbox_command_emits_structured_json_when_requested() {
     assert!(parsed["filesystem_mode"].as_str().is_some());
     assert!(parsed["allowed_mounts"].is_array());
     assert!(parsed["markers"].is_array());
+}
+
+#[test]
+fn resumed_version_command_emits_structured_json() {
+    let temp_dir = unique_temp_dir("resume-version-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    Session::new()
+        .save_to_path(&session_path)
+        .expect("session should persist");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/version",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["kind"], "version");
+    assert!(parsed["version"].as_str().is_some());
+    assert!(parsed["git_sha"].as_str().is_some());
+    assert!(parsed["target"].as_str().is_some());
+}
+
+#[test]
+fn resumed_export_command_emits_structured_json() {
+    let temp_dir = unique_temp_dir("resume-export-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    let mut session = Session::new();
+    session
+        .push_user_text("export json fixture")
+        .expect("write ok");
+    session.save_to_path(&session_path).expect("persist ok");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/export",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["kind"], "export");
+    assert!(parsed["file"].as_str().is_some());
+    assert_eq!(parsed["message_count"], 1);
+}
+
+#[test]
+fn resumed_help_command_emits_structured_json() {
+    let temp_dir = unique_temp_dir("resume-help-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    Session::new()
+        .save_to_path(&session_path)
+        .expect("persist ok");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/help",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["kind"], "help");
+    assert!(parsed["text"].as_str().is_some());
+    let text = parsed["text"].as_str().unwrap();
+    assert!(text.contains("/status"), "help text should list /status");
+}
+
+#[test]
+fn resumed_no_command_emits_restored_json() {
+    let temp_dir = unique_temp_dir("resume-no-cmd-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    let mut session = Session::new();
+    session
+        .push_user_text("restored json fixture")
+        .expect("write ok");
+    session.save_to_path(&session_path).expect("persist ok");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let parsed: Value = serde_json::from_str(stdout.trim()).expect("should be json");
+    assert_eq!(parsed["kind"], "restored");
+    assert!(parsed["session_id"].as_str().is_some());
+    assert!(parsed["path"].as_str().is_some());
+    assert_eq!(parsed["message_count"], 1);
+}
+
+#[test]
+fn resumed_stub_command_emits_not_implemented_json() {
+    let temp_dir = unique_temp_dir("resume-stub-json");
+    fs::create_dir_all(&temp_dir).expect("temp dir should exist");
+    let session_path = temp_dir.join("session.jsonl");
+    Session::new()
+        .save_to_path(&session_path)
+        .expect("persist ok");
+
+    let output = run_claw(
+        &temp_dir,
+        &[
+            "--output-format",
+            "json",
+            "--resume",
+            session_path.to_str().expect("utf8 path"),
+            "/allowed-tools",
+        ],
+    );
+
+    // Stub commands exit with code 2
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("utf8");
+    let parsed: Value = serde_json::from_str(stderr.trim()).expect("should be json");
+    assert_eq!(parsed["type"], "error");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("not yet implemented"),
+        "error should say not yet implemented: {:?}",
+        parsed["error"]
+    );
 }
 
 fn run_claw(current_dir: &Path, args: &[&str]) -> Output {
